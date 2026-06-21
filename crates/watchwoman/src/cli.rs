@@ -7,7 +7,7 @@ use anyhow::Context;
 use clap::{CommandFactory, Parser};
 use clap_complete::{generate, Shell};
 use indexmap::IndexMap;
-use watchwoman_protocol::{json, Value};
+use watchwoman_protocol::{bser, json, Encoding as ProtoEncoding, Value};
 
 use crate::sock;
 
@@ -91,6 +91,18 @@ pub enum Encoding {
     Bser,
     #[value(alias = "bser-v2")]
     Bser2,
+}
+
+impl Encoding {
+    /// `None` for JSON (handled as text), `Some` for the BSER variants
+    /// (handled as a raw wire-format dump).
+    fn as_bser(self) -> Option<ProtoEncoding> {
+        match self {
+            Encoding::Json => None,
+            Encoding::Bser => Some(ProtoEncoding::BserV1),
+            Encoding::Bser2 => Some(ProtoEncoding::BserV2),
+        }
+    }
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -408,7 +420,13 @@ pub fn run() -> anyhow::Result<ExitCode> {
     // `-j` / `--json-command` reads the PDU from stdin and skips
     // subcommand parsing. Mutually exclusive with a subcommand.
     if cli.json_command {
-        return run_stdin_json(&sock_path, cli.no_pretty, cli.no_spawn, cli.persistent);
+        return run_stdin_json(
+            &sock_path,
+            cli.output_encoding,
+            cli.no_pretty,
+            cli.no_spawn,
+            cli.persistent,
+        );
     }
 
     let Some(cmd) = cli.command else {
@@ -430,10 +448,11 @@ pub fn run() -> anyhow::Result<ExitCode> {
         Command::InstallAgent => install_launch_agent(),
         #[cfg(target_os = "macos")]
         Command::UninstallAgent => uninstall_launch_agent(),
-        Command::Status { json } => run_status(&sock_path, cli.no_spawn, json),
+        Command::Status { json } => run_status(&sock_path, cli.no_spawn, json, cli.output_encoding),
         other => run_client(
             &other,
             &sock_path,
+            cli.output_encoding,
             cli.no_pretty,
             cli.no_spawn,
             cli.persistent,
@@ -443,7 +462,12 @@ pub fn run() -> anyhow::Result<ExitCode> {
 
 /// Dispatch `status` — the server always replies in JSON, we either
 /// pretty-print it as a human report or pass it straight through.
-fn run_status(sock_path: &Path, no_spawn: bool, want_json: bool) -> anyhow::Result<ExitCode> {
+fn run_status(
+    sock_path: &Path,
+    no_spawn: bool,
+    want_json: bool,
+    output_encoding: Encoding,
+) -> anyhow::Result<ExitCode> {
     let pdu = Value::Array(vec![Value::String("status".into())]);
     let stream = connect_or_spawn(sock_path, no_spawn)?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
@@ -457,8 +481,11 @@ fn run_status(sock_path: &Path, no_spawn: bool, want_json: bool) -> anyhow::Resu
     let err_present = response
         .as_object()
         .is_some_and(|o| o.contains_key("error"));
-    if want_json || err_present {
-        print_response(&response, false)?;
+    // The human-readable report is a CLI-only convenience layered on
+    // top of the JSON the server returns; a non-default --output-encoding
+    // means the caller wants the raw wire value, not the formatted report.
+    if want_json || err_present || output_encoding.as_bser().is_some() {
+        print_response(&response, output_encoding, false)?;
     } else {
         print_status_report(&response)?;
     }
@@ -473,7 +500,7 @@ fn print_status_report(v: &Value) -> anyhow::Result<()> {
     let obj = match v.as_object() {
         Some(o) => o,
         None => {
-            print_response(v, false)?;
+            print_response(v, Encoding::Json, false)?;
             return Ok(());
         }
     };
@@ -706,16 +733,25 @@ fn init_tracing(logfile: Option<&str>, level: Option<u8>) {
 fn run_client(
     cmd: &Command,
     sock_path: &Path,
+    output_encoding: Encoding,
     no_pretty: bool,
     no_spawn: bool,
     persistent: bool,
 ) -> anyhow::Result<ExitCode> {
     let pdu = build_pdu(cmd)?;
-    send_and_print(&pdu, sock_path, no_pretty, no_spawn, persistent)
+    send_and_print(
+        &pdu,
+        sock_path,
+        output_encoding,
+        no_pretty,
+        no_spawn,
+        persistent,
+    )
 }
 
 fn run_stdin_json(
     sock_path: &Path,
+    output_encoding: Encoding,
     no_pretty: bool,
     no_spawn: bool,
     persistent: bool,
@@ -730,12 +766,20 @@ fn run_stdin_json(
     }
     let json: serde_json::Value = serde_json::from_str(trimmed).context("parsing stdin PDU")?;
     let pdu = json_to_value(json);
-    send_and_print(&pdu, sock_path, no_pretty, no_spawn, persistent)
+    send_and_print(
+        &pdu,
+        sock_path,
+        output_encoding,
+        no_pretty,
+        no_spawn,
+        persistent,
+    )
 }
 
 fn send_and_print(
     pdu: &Value,
     sock_path: &Path,
+    output_encoding: Encoding,
     no_pretty: bool,
     no_spawn: bool,
     persistent: bool,
@@ -757,7 +801,7 @@ fn send_and_print(
     let mut reader = std::io::BufReader::new(stream);
     let response = json::read_pdu(&mut reader)?.context("daemon closed connection early")?;
 
-    print_response(&response, no_pretty)?;
+    print_response(&response, output_encoding, no_pretty)?;
     let err_present = response
         .as_object()
         .is_some_and(|o| o.contains_key("error"));
@@ -766,7 +810,7 @@ fn send_and_print(
         // Drain subsequent unilateral PDUs until the daemon closes the
         // connection or the user hits SIGINT.
         while let Some(v) = json::read_pdu(&mut reader)? {
-            print_response(&v, no_pretty)?;
+            print_response(&v, output_encoding, no_pretty)?;
         }
     }
 
@@ -1031,15 +1075,23 @@ fn absolutise(path: &str) -> String {
     }
 }
 
-fn print_response(v: &Value, no_pretty: bool) -> anyhow::Result<()> {
-    let j = value_to_serde(v);
-    let mut out = io::stdout().lock();
-    if no_pretty {
-        serde_json::to_writer(&mut out, &j)?;
-    } else {
-        serde_json::to_writer_pretty(&mut out, &j)?;
-    }
-    out.write_all(b"\n")?;
+fn print_response(v: &Value, output_encoding: Encoding, no_pretty: bool) -> anyhow::Result<()> {
+    let Some(bser_version) = output_encoding.as_bser() else {
+        let j = value_to_serde(v);
+        let mut out = io::stdout().lock();
+        if no_pretty {
+            serde_json::to_writer(&mut out, &j)?;
+        } else {
+            serde_json::to_writer_pretty(&mut out, &j)?;
+        }
+        out.write_all(b"\n")?;
+        return Ok(());
+    };
+
+    // BSER output is a raw wire-format dump, not text — no trailing
+    // newline, and pretty-printing doesn't apply.
+    let bytes = bser::encode_pdu(v, bser_version)?;
+    io::stdout().write_all(&bytes)?;
     Ok(())
 }
 
