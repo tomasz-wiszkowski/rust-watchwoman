@@ -89,6 +89,7 @@ pub struct Cli {
 pub enum Encoding {
     Json,
     Bser,
+    #[value(alias = "bser-v2")]
     Bser2,
 }
 
